@@ -9,9 +9,8 @@ expose service their status through the [gRPC Health Checking Protocol][hc].
 `grpc_health_probe` is meant to be used for health checking gRPC applications in
 [Kubernetes][k8s], using the [exec probes][execprobe].
 
-> :warning: [**Kubernetes v1.23 has now introduced built-in gRPC health checking**][k8s-new]
-> capability as an alpha feature. As a result, you might no longer need to use this tool and use the
-> native Kubernetes feature instead.
+> :warning: [**Kubernetes has now built-in gRPC health checking**][k8s-new]
+> capability as generally available. As a result, you might no longer need to use this tool and can use the native Kubernetes feature instead.
 >
 > This tool can still be useful if you are on older versions of Kubernetes,
 > or using advanced configuration (such as custom metadata, TLS or finer timeout tuning),
@@ -43,34 +42,34 @@ exit status 2
 Installing from source (not recommended):
 
 - Make sure you have `git` and `go` installed.
-- Run: `go get github.com/grpc-ecosystem/grpc-health-probe`
+- Run: `go install github.com/grpc-ecosystem/grpc-health-probe@latest`
 - This will compile the binary into your `$GOPATH/bin` (or `$HOME/go/bin`).
 
 ## Using the gRPC Health Checking Protocol
 
 To make use of the `grpc_health_probe`, your application must implement the
-[gRPC Health Checking Protocol v1][hc]. This means you must to register the
+[gRPC Health Checking Protocol v1][hc]. This means you must register the
 `Health` service and implement the `rpc Check` that returns a `SERVING` status.
 
 Since the Health Checking protocol is part of the gRPC core, it has
 packages/libraries available for the languages supported by gRPC:
 
 [[health.proto](https://github.com/grpc/grpc/blob/master/src/proto/grpc/health/v1/health.proto)]
-[[Go](https://godoc.org/google.golang.org/grpc/health/grpc_health_v1)]
+[[Go](https://pkg.go.dev/google.golang.org/grpc/health/grpc_health_v1)]
 [[Java](https://github.com/grpc/grpc-java/blob/master/services/src/generated/main/grpc/io/grpc/health/v1/HealthGrpc.java)]
 [[Python](https://github.com/grpc/grpc/tree/master/src/python/grpcio_health_checking)]
 [[C#](https://github.com/grpc/grpc/tree/master/src/csharp/Grpc.HealthCheck)/[NuGet](https://www.nuget.org/packages/Grpc.HealthCheck/)]
 [[Ruby](https://www.rubydoc.info/gems/grpc/Grpc/Health/Checker)] ...
 
-Most of the languages listed above provide helper functions that hides
+Most of the languages listed above provide helper functions that hide
 implementation details. This eliminates the need for you to implement the
 `Check` rpc yourself.
 
 ## Example: gRPC health checking on Kubernetes
 
-Kubernetes does not natively support gRPC health checking since it does not
-favor one RPC framework over another. Similarly, HTTP health probes Kubernetes
-has is not sufficient to craft a valid gRPC request. As a solution,
+Kubernetes now supports [gRPC health checking][k8s]. If your cluster is running a version that supports gRPC health checking, you can define a gRPC liveness probe in your Pod specification. For more information on how to define a gRPC liveness probe in Kubernetes, see the [Kubernetes documentation][k8s-new].
+
+However, if your Kubernetes version does not support gRPC health checking or if you want to use some advanced features that Kubernetes does not support, you can use `grpc_health_probe` to health-check your gRPC server. As a solution,
 `grpc_health_probe` [can be used for Kubernetes][k8s] to health-check gRPC
 servers running in the Pod.
 
@@ -81,9 +80,16 @@ You can bundle the statically compiled `grpc_health_probe` in your container
 image. Choose a [binary release][rel] and download it in your Dockerfile:
 
 ```bash
-RUN GRPC_HEALTH_PROBE_VERSION=v0.3.1 && \
-    wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-amd64 && \
+ARG TARGETOS TARGETARCH
+RUN GRPC_HEALTH_PROBE_VERSION=v0.4.38 && \
+    wget -qO/bin/grpc_health_probe https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-${TARGETOS}-${TARGETARCH} && \
     chmod +x /bin/grpc_health_probe
+```
+
+or via release image:
+
+```dockerfile
+COPY --from=ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.38 /ko-app/grpc-health-probe /bin/grpc_health_probe
 ```
 
 In your Kubernetes Pod specification manifest, specify a `livenessProbe` and/or
@@ -106,7 +112,7 @@ spec:
       initialDelaySeconds: 10
 ```
 
-This approach provide proper readiness/liveness checking to your applications
+This approach provides proper readiness/liveness checking to your applications
 that implement the [gRPC Health Checking Protocol][hc].
 
 ## Health Checking TLS Servers
@@ -126,7 +132,7 @@ with command-line options:
 
 ## Health checking TLS Servers with SPIFFE issued credentials
 
-If your gRPC server requires authentication, you can use the following command line options and set the 
+If your gRPC server requires authentication, you can use the following command line options and set the
 [SPIFFE_ENDPOINT_SOCKET][spiffe-socket]
 environment variable.
 
@@ -145,6 +151,7 @@ environment variable.
 | **`-user-agent`** | user-agent header value of health check requests (default: grpc_health_probe) |
 | **`-service`** | service name to check (default: "") - empty string is convention for server health |
 | **`-gzip`** | use GZIPCompressor for requests and GZIPDecompressor for response (default: false) |
+| **`-version`** | print the probe version and exit |
 
 **Example:**
 

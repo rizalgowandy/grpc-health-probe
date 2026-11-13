@@ -1,19 +1,118 @@
 name: ci
 on:
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+# A new push to a PR cancels its older runs. Every other run gets a group of its
+# own: a shared one would let a newer queued master run replace an older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
-    runs-on: ubuntu-latest
+  test:
+    name: test (${{ matrix.os }}${{ matrix.goarch && format(', {0}', matrix.goarch) || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-latest, macos-26-intel, windows-latest]
+        race: [-race]
+        include:
+        - os: windows-11-arm # the race detector doesn't support windows/arm64
+          race: ''
+        # The Linux architectures that get a release binary but have no hosted
+        # runner. go test cross-compiles the tests and the probe for them: 386
+        # runs natively on the x64 runner, the rest under QEMU user-mode
+        # emulation. The race detector can't be cross-compiled without a C
+        # toolchain, and doesn't support 386 and arm at all.
+        - {os: ubuntu-26.04, goarch: '386', race: ''}
+        - {os: ubuntu-26.04, goarch: arm, goarm: '6', race: ''} # GOARM as in .goreleaser.yml
+        - {os: ubuntu-26.04, goarch: ppc64le, race: ''}
+        - {os: ubuntu-26.04, goarch: riscv64, race: ''}
+        - {os: ubuntu-26.04, goarch: s390x, race: ''}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # git checkout
+
     steps:
     - name: Checkout
-      uses: actions/checkout@master
-    - name: Setup Go
-      uses: actions/setup-go@v1
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        go-version: 1.17
+        persist-credentials: false
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+        # The cache key holds the runner's architecture, not GOARCH: without
+        # this, a cross-compiling job could save its build cache under the key
+        # the native ubuntu-26.04 jobs restore.
+        cache: ${{ !matrix.goarch }}
+    - name: Set up QEMU
+      if: matrix.goarch && matrix.goarch != '386'
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      with:
+        platforms: ${{ matrix.goarch }}
+    - name: Test
+      shell: bash
+      env:
+        RACE: ${{ matrix.race }}
+        # Empty outside the cross-compiling entries, which Go reads as unset.
+        GOARCH: ${{ matrix.goarch }}
+        GOARM: ${{ matrix.goarm }}
+      run: |
+        # $RACE is unquoted so that it disappears where it's empty. The e2e
+        # package runs once, below, with the probe's coverage collected.
+        # shellcheck disable=SC2046,SC2086
+        go test $RACE -cover $(go list ./... | grep -v /internal/e2e)
+        export GOCOVERDIR="$RUNNER_TEMP/covdata"
+        mkdir -p "$GOCOVERDIR"
+        # shellcheck disable=SC2086
+        go test $RACE ./internal/e2e
+        go tool covdata percent -i="$GOCOVERDIR"
+
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # git checkout
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
     - name: GoReleaser
-      uses: goreleaser/goreleaser-action@v1
+      uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
       with:
         version: latest
-        args: release --snapshot --rm-dist
+        args: release --snapshot --clean --skip ko
+      env:
+        KO_DOCKER_REPO: "dummy"
+
+  # The required status check on master: passes only if every build and test
+  # job did. always() makes it fail instead of being skipped, which counts as
+  # passing, when a job it needs failed.
+  ci:
+    needs: [build, test]
+    if: always()
+    runs-on: ubuntu-slim
+    permissions: {}
+
+    steps:
+    - name: Check job results
+      env:
+        RESULTS: ${{ join(needs.*.result, ' ') }}
+      run: |
+        echo "$RESULTS"
+        for result in $RESULTS; do
+          [ "$result" = success ] || exit 1
+        done

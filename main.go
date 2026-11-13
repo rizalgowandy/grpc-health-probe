@@ -19,11 +19,12 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -33,6 +34,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/alts"
+	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -53,6 +55,7 @@ var (
 	flTLSServerName string
 	flALTS          bool
 	flVerbose       bool
+	flVersion       bool
 	flGZIP          bool
 	flSPIFFE        bool
 )
@@ -89,6 +92,7 @@ func init() {
 	flagSet.StringVar(&flTLSServerName, "tls-server-name", "", "(with -tls) override the hostname used to verify the server certificate")
 	flagSet.BoolVar(&flALTS, "alts", false, "use ALTS (default: false, INSECURE plaintext transport)")
 	flagSet.BoolVar(&flVerbose, "v", false, "verbose logs")
+	flagSet.BoolVar(&flVersion, "version", false, "show probe version and exit")
 	flagSet.BoolVar(&flGZIP, "gzip", false, "use GZIPCompressor for requests and GZIPDecompressor for response (default: false)")
 	flagSet.BoolVar(&flSPIFFE, "spiffe", false, "use SPIFFE to obtain mTLS credentials")
 
@@ -97,9 +101,14 @@ func init() {
 		os.Exit(StatusInvalidArguments)
 	}
 
-	argError := func(s string, v ...interface{}) {
+	argError := func(s string, v ...any) {
 		log.Printf("error: "+s, v...)
 		os.Exit(StatusInvalidArguments)
+	}
+
+	if flVersion {
+		fmt.Println(probeVersion())
+		os.Exit(0)
 	}
 
 	if flAddr == "" {
@@ -191,7 +200,7 @@ func buildCredentials(skipVerify bool, caCerts, clientCert, clientKey, serverNam
 	} else if caCerts != "" {
 		// override system roots
 		rootCAs := x509.NewCertPool()
-		pem, err := ioutil.ReadFile(caCerts)
+		pem, err := os.ReadFile(caCerts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load root CA certificates from file (%s) error=%v", caCerts, err)
 		}
@@ -206,6 +215,52 @@ func buildCredentials(skipVerify bool, caCerts, clientCert, clientKey, serverNam
 	return credentials.NewTLS(&cfg), nil
 }
 
+var versionTag = "" // set from git tag via ldflags during build
+
+func probeVersion() string {
+	info, _ := debug.ReadBuildInfo()
+	return formatVersion(versionTag, info)
+}
+
+// formatVersion builds the -version output from the ldflags tag and the build
+// info, which is nil when the binary carries none. It prints whichever of the
+// tag and the commit it knows, and says so only when it knows neither.
+func formatVersion(tag string, info *debug.BuildInfo) string {
+	commit := ""
+	dirty := ""
+
+	if info != nil {
+		// Without ldflags, fall back to the module version Go stamps from git or
+		// go install, in the form GoReleaser passes: no "v" prefix. "+dirty"
+		// goes too, since " (dirty)" below already says it.
+		if tag == "" && info.Main.Version != "(devel)" {
+			tag = strings.TrimSuffix(strings.TrimPrefix(info.Main.Version, "v"), "+dirty")
+		}
+		for _, setting := range info.Settings {
+
+			switch setting.Key {
+			case "vcs.revision":
+				commit = "commit " + setting.Value
+			case "vcs.modified":
+				dirty = setting.Value
+			}
+		}
+	}
+	if commit != "" && dirty == "true" {
+		commit += " (dirty)"
+	}
+
+	switch {
+	case tag == "" && commit == "":
+		return "vcs info was not included in build"
+	case commit == "":
+		return tag
+	case tag == "":
+		return commit
+	}
+	return tag + "; " + commit
+}
+
 func main() {
 	retcode := 0
 	defer func() { os.Exit(retcode) }()
@@ -213,14 +268,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-c
-		if sig == os.Interrupt {
-			log.Printf("cancellation received")
-			cancel()
-			return
-		}
+		log.Printf("cancellation received (signal: %v)", sig)
+		cancel()
 	}()
 
 	opts := []grpc.DialOption{
@@ -261,7 +313,7 @@ func main() {
 		creds := credentials.NewTLS(tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeAny()))
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	} else {
-		opts = append(opts, grpc.WithInsecure())
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
 	if flGZIP {
